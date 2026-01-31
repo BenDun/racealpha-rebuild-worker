@@ -47,12 +47,13 @@ def update_status(status: str, phase: str = None, phase_number: int = 0,
         return
     
     try:
-        url = f"{SUPABASE_URL}/rest/v1/rebuild_status"
+        # Use upsert with on_conflict to handle duplicate run_id
+        url = f"{SUPABASE_URL}/rest/v1/rebuild_status?on_conflict=run_id"
         headers = {
             "apikey": SUPABASE_SERVICE_KEY,
             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
             "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates"
+            "Prefer": "return=minimal,resolution=merge-duplicates"
         }
         
         data = {
@@ -267,7 +268,7 @@ def run_rebuild():
             rr.horse_slug,
             rr.horse_slug || '_' || COALESCE(r.location, 'AU') AS horse_location_slug,
             rr.barrier,
-            rr.weight_carried,
+            rr.original_weight AS weight_carried,
             rr.horse_number,
             
             -- Jockey/Trainer
