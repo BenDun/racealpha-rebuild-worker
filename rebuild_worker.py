@@ -230,7 +230,7 @@ def run_rebuild():
             r.race_distance,
             r.race_class,
             r.track_condition,
-            r.prize_money,
+            r.total_prize_money AS prize_money,
             COALESCE(r.location, 'AU') AS location,
             
             -- Horse info
