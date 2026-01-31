@@ -168,7 +168,7 @@ def run_rebuild():
             r.race_date,
             r.race_number,
             r.track_name,
-            r.distance AS race_distance,
+            r.race_distance,
             r.race_class,
             r.track_condition,
             r.prize_money,
