@@ -96,6 +96,35 @@ def get_db_connection_string() -> str:
     return f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 
 
+def run_test_mode():
+    """Test mode - just updates status without running rebuild"""
+    log("=" * 60)
+    log("TEST MODE - Status API Test")
+    log(f"Run ID: {RUN_ID}")
+    log("=" * 60)
+    
+    update_status("starting", "Test Mode", 0, "Testing status API...")
+    time.sleep(2)
+    
+    update_status("extracting", "Phase 1: Test", 1, "Simulating extraction...")
+    time.sleep(2)
+    
+    update_status("transforming", "Phase 2: Test", 2, "Simulating transform...")
+    time.sleep(2)
+    
+    update_status("transforming", "Phase 3: Test", 3, "Simulating career stats...")
+    time.sleep(2)
+    
+    update_status("transforming", "Phase 4: Test", 4, "Simulating advanced features...")
+    time.sleep(2)
+    
+    update_status("completed", "Complete", 5, "Test completed successfully!", 
+                  rows_processed=12345, duration_seconds=10.0)
+    
+    log("✅ Test mode completed - check rebuild_status table")
+    return {"status": "test_success", "rows": 12345}
+
+
 def run_rebuild():
     """Main rebuild function"""
     start_time = time.time()
@@ -716,10 +745,18 @@ def run_rebuild():
     }
 
 
+# Check for TEST_MODE environment variable
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
+
+
 if __name__ == "__main__":
     try:
-        result = run_rebuild()
-        print(f"\n✅ Rebuild completed successfully: {result}")
+        if TEST_MODE:
+            result = run_test_mode()
+            print(f"\n✅ Test mode completed: {result}")
+        else:
+            result = run_rebuild()
+            print(f"\n✅ Rebuild completed successfully: {result}")
     except Exception as e:
         update_status("failed", "Error", 0, error_message=str(e))
         log(f"FATAL ERROR: {e}", "ERROR")
