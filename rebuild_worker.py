@@ -10,7 +10,9 @@ Schedule: Weekly Sunday 2am AEST (via Railway cron)
 import os
 import sys
 import time
+import uuid
 import duckdb
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -21,16 +23,62 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://pabqrixgzcnqttrkwkil.supabase.co")
 DATABASE_URL = os.getenv("DATABASE_URL")  # Direct postgres connection string
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+TRIGGERED_BY = os.getenv("TRIGGERED_BY", "manual")  # manual, cron, api
 
 # DuckDB settings
 DUCKDB_MEMORY_LIMIT = "4GB"
 DUCKDB_THREADS = 4
+
+# Global run ID for status tracking
+RUN_ID = f"rebuild_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
 
 
 def log(message: str, level: str = "INFO"):
     """Timestamped logging"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}", flush=True)
+
+
+def update_status(status: str, phase: str = None, phase_number: int = 0, 
+                  message: str = None, rows_processed: int = 0, 
+                  error_message: str = None, duration_seconds: float = None):
+    """Update rebuild status in Supabase"""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/rebuild_status"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates"
+        }
+        
+        data = {
+            "run_id": RUN_ID,
+            "status": status,
+            "phase": phase,
+            "phase_number": phase_number,
+            "total_phases": 5,
+            "message": message,
+            "rows_processed": rows_processed,
+            "updated_at": datetime.utcnow().isoformat(),
+            "triggered_by": TRIGGERED_BY
+        }
+        
+        if error_message:
+            data["error_message"] = error_message
+        if duration_seconds:
+            data["duration_seconds"] = round(duration_seconds, 2)
+        if status == "completed" or status == "failed":
+            data["completed_at"] = datetime.utcnow().isoformat()
+        
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code not in [200, 201]:
+            log(f"Warning: Failed to update status: {response.text}", "WARN")
+    except Exception as e:
+        log(f"Warning: Could not update status: {e}", "WARN")
 
 
 def get_db_connection_string() -> str:
@@ -53,7 +101,11 @@ def run_rebuild():
     start_time = time.time()
     log("=" * 60)
     log("RACEALPHA TRAINING DATASET REBUILD - STARTING")
+    log(f"Run ID: {RUN_ID}")
     log("=" * 60)
+    
+    # Initial status update
+    update_status("starting", "Initializing", 0, "Starting rebuild worker...")
     
     # Initialize DuckDB
     log("Initializing DuckDB...")
@@ -78,8 +130,10 @@ def run_rebuild():
             ATTACH '{db_url}' AS supa (TYPE POSTGRES, READ_ONLY)
         """)
         log("✓ Connected to Supabase")
+        update_status("starting", "Initializing", 0, "Connected to Supabase")
     except Exception as e:
         log(f"✗ Failed to connect to Supabase: {e}", "ERROR")
+        update_status("failed", "Initializing", 0, error_message=str(e))
         sys.exit(1)
     
     # ==========================================================================
@@ -90,6 +144,7 @@ def run_rebuild():
     log("=" * 60)
     log("PHASE 1: EXTRACT SOURCE DATA")
     log("=" * 60)
+    update_status("extracting", "Phase 1: Extract", 1, "Extracting source tables from Supabase...")
     
     log("Extracting races table...")
     con.execute("""
@@ -101,6 +156,7 @@ def run_rebuild():
     log(f"  ✓ races: {races_count:,} rows")
     
     log("Extracting race_results table...")
+    update_status("extracting", "Phase 1: Extract", 1, f"Extracted {races_count:,} races, now extracting results...")
     con.execute("""
         CREATE TABLE race_results AS 
         SELECT * FROM supa.public.race_results
@@ -110,6 +166,7 @@ def run_rebuild():
     log(f"  ✓ race_results: {results_count:,} rows")
     
     log("Extracting sectional times...")
+    update_status("extracting", "Phase 1: Extract", 1, f"Extracted {results_count:,} results, now extracting sectionals...")
     con.execute("""
         CREATE TABLE race_results_sectional_times AS 
         SELECT * FROM supa.public.race_results_sectional_times
@@ -119,6 +176,7 @@ def run_rebuild():
     log(f"  ✓ race_results_sectional_times: {sectional_count:,} rows")
     
     log(f"Phase 1 complete in {time.time() - phase_start:.1f}s")
+    update_status("extracting", "Phase 1: Extract", 1, f"Complete: {races_count:,} races, {results_count:,} results, {sectional_count:,} sectionals")
     
     # ==========================================================================
     # PHASE 2: BASE REBUILD
@@ -128,6 +186,7 @@ def run_rebuild():
     log("=" * 60)
     log("PHASE 2: BASE REBUILD")
     log("=" * 60)
+    update_status("transforming", "Phase 2: Base Rebuild", 2, "Creating base training dataset...")
     
     # Fix location data
     log("Fixing location data...")
@@ -331,6 +390,7 @@ def run_rebuild():
     log("=" * 60)
     log("PHASE 3: CAREER & FORM STATS (Anti-leakage)")
     log("=" * 60)
+    update_status("transforming", "Phase 3: Career Stats", 3, "Calculating career and form statistics...")
     
     # Horse career stats with anti-leakage window
     log("Calculating horse career stats...")
@@ -497,6 +557,7 @@ def run_rebuild():
     con.execute("UPDATE race_training_dataset SET never_placed_flag = (total_races > 0 AND places = 0)")
     
     log(f"Phase 3 complete in {time.time() - phase_start:.1f}s")
+    update_status("transforming", "Phase 3: Career Stats", 3, "Complete: Career stats, ELO, jockey/trainer rates calculated")
     
     # ==========================================================================
     # PHASE 4: ADVANCED FEATURES
@@ -506,6 +567,7 @@ def run_rebuild():
     log("=" * 60)
     log("PHASE 4: ADVANCED FEATURES")
     log("=" * 60)
+    update_status("transforming", "Phase 4: Advanced Features", 4, "Calculating running style, class ratings, field percentiles...")
     
     # Position improvement
     log("Calculating position improvements...")
@@ -574,6 +636,7 @@ def run_rebuild():
     """)
     
     log(f"Phase 4 complete in {time.time() - phase_start:.1f}s")
+    update_status("transforming", "Phase 4: Advanced Features", 4, "Complete: Running styles, class ratings, odds features calculated")
     
     # ==========================================================================
     # PHASE 5: EXPORT TO SUPABASE
@@ -583,6 +646,7 @@ def run_rebuild():
     log("=" * 60)
     log("PHASE 5: EXPORT TO SUPABASE")
     log("=" * 60)
+    update_status("loading", "Phase 5: Export", 5, "Writing results back to Supabase...")
     
     final_count = con.execute("SELECT COUNT(*) FROM race_training_dataset").fetchone()[0]
     log(f"Final dataset: {final_count:,} rows")
@@ -635,6 +699,16 @@ def run_rebuild():
     log(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
     log("=" * 60)
     
+    # Final success status
+    update_status(
+        "completed", 
+        "Complete", 
+        5, 
+        f"Successfully rebuilt {final_count:,} rows in {total_time/60:.1f} minutes",
+        rows_processed=final_count,
+        duration_seconds=total_time
+    )
+    
     return {
         "status": "success",
         "rows": final_count,
@@ -647,6 +721,7 @@ if __name__ == "__main__":
         result = run_rebuild()
         print(f"\n✅ Rebuild completed successfully: {result}")
     except Exception as e:
+        update_status("failed", "Error", 0, error_message=str(e))
         log(f"FATAL ERROR: {e}", "ERROR")
         import traceback
         traceback.print_exc()
