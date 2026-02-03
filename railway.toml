@@ -5,3 +5,7 @@ dockerfilePath = "Dockerfile"
 [deploy]
 startCommand = "python rebuild_worker.py"
 restartPolicyType = "NEVER"
+
+# To enable weekly cron, uncomment the following:
+# [cron]
+# schedule = "0 16 * * 0"  # Sunday 2am AEST (4pm UTC Saturday)

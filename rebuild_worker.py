@@ -1,19 +1,36 @@
 """
-RaceAlpha Training Dataset Rebuild Worker
-==========================================
-Uses DuckDB for fast local processing, then syncs back to Supabase.
+RaceAlpha Training Dataset Rebuild Worker - V2
+===============================================
+Executes rebuild_v2 SQL scripts directly on Supabase PostgreSQL.
 
 Run: python rebuild_worker.py
 Schedule: Weekly Sunday 2am AEST (via Railway cron)
+
+Phases (from rebuild_v2):
+  1. Base Rebuild (01_base_rebuild.sql)
+  2. Career & Form Stats (02_career_form_stats.sql)
+  3. Advanced Features (03_advanced_features.sql)
+  4. Interactions & Validation (04_interactions_validation.sql)
+  5. Sectional Backfill (05_sectional_backfill.sql)
+  6. Sectional Pattern Features (06_sectional_pattern_features.sql)
+  7. ELO Rebuild & Sync (07_elo_rebuild_and_sync.sql)
+  8. Current Form Views (06_current_form_views.sql)
+  9. Validation & Cleanup
+
+Approach: Runs native PostgreSQL SQL directly on Supabase via psycopg2.
+SQL files stored in sql/ directory within this repo.
 """
 
 import os
 import sys
 import time
 import uuid
-import duckdb
+import re
 import requests
+import psycopg2
+import threading
 from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -21,16 +38,80 @@ load_dotenv()
 
 # Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://pabqrixgzcnqttrkwkil.supabase.co")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Direct postgres connection string
+DATABASE_URL = os.getenv("DATABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-TRIGGERED_BY = os.getenv("TRIGGERED_BY", "manual")  # manual, cron, api
+TRIGGERED_BY = os.getenv("TRIGGERED_BY", "manual")
 
-# DuckDB settings
-DUCKDB_MEMORY_LIMIT = "4GB"
-DUCKDB_THREADS = 4
+# DRY_RUN mode - creates test table without affecting production
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+TEST_TABLE_NAME = "race_training_dataset_test"
+PROD_TABLE_NAME = "race_training_dataset"
 
-# Global run ID for status tracking
+# SQL files directory
+SQL_DIR = Path(__file__).parent / "sql"
+
+# Total phases for progress tracking
+TOTAL_PHASES = 11
+
+# Global run ID
 RUN_ID = f"rebuild_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
+
+# Progress bar settings
+PROGRESS_BAR_WIDTH = 40
+SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+
+class ProgressSpinner:
+    """Background spinner with elapsed time for long-running operations"""
+    def __init__(self, message: str):
+        self.message = message
+        self.running = False
+        self.thread = None
+        self.start_time = None
+        
+    def _spin(self):
+        idx = 0
+        while self.running:
+            elapsed = time.time() - self.start_time
+            mins, secs = divmod(int(elapsed), 60)
+            spinner = SPINNER_CHARS[idx % len(SPINNER_CHARS)]
+            status = f"\r{spinner} {self.message} [{mins:02d}:{secs:02d}]"
+            sys.stdout.write(status)
+            sys.stdout.flush()
+            idx += 1
+            time.sleep(0.1)
+    
+    def start(self):
+        self.running = True
+        self.start_time = time.time()
+        self.thread = threading.Thread(target=self._spin, daemon=True)
+        self.thread.start()
+    
+    def stop(self, final_message: str = None):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=0.5)
+        elapsed = time.time() - self.start_time
+        mins, secs = divmod(int(elapsed), 60)
+        if final_message:
+            sys.stdout.write(f"\r✓ {final_message} [{mins:02d}:{secs:02d}]\n")
+        else:
+            sys.stdout.write(f"\r✓ {self.message} [{mins:02d}:{secs:02d}]\n")
+        sys.stdout.flush()
+
+
+def progress_bar(current: int, total: int, prefix: str = "", suffix: str = "") -> str:
+    """Generate a progress bar string"""
+    percent = current / total if total > 0 else 0
+    filled = int(PROGRESS_BAR_WIDTH * percent)
+    bar = '█' * filled + '░' * (PROGRESS_BAR_WIDTH - filled)
+    return f"{prefix} [{bar}] {current}/{total} {suffix}"
+
+
+def print_phase_progress(phase_num: int, total_phases: int, phase_name: str):
+    """Print overall phase progress"""
+    bar = progress_bar(phase_num, total_phases, prefix="Overall Progress:", suffix=f"- Phase {phase_num}: {phase_name}")
+    print(f"\n{bar}", flush=True)
 
 
 def log(message: str, level: str = "INFO"):
@@ -39,15 +120,14 @@ def log(message: str, level: str = "INFO"):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 
-def update_status(status: str, phase: str = None, phase_number: int = 0, 
-                  message: str = None, rows_processed: int = 0, 
+def update_status(status: str, phase: str = None, phase_number: int = 0,
+                  message: str = None, rows_processed: int = 0,
                   error_message: str = None, duration_seconds: float = None):
     """Update rebuild status in Supabase"""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return
-    
+
     try:
-        # Use upsert with on_conflict to handle duplicate run_id
         url = f"{SUPABASE_URL}/rest/v1/rebuild_status?on_conflict=run_id"
         headers = {
             "apikey": SUPABASE_SERVICE_KEY,
@@ -55,26 +135,26 @@ def update_status(status: str, phase: str = None, phase_number: int = 0,
             "Content-Type": "application/json",
             "Prefer": "return=minimal,resolution=merge-duplicates"
         }
-        
+
         data = {
             "run_id": RUN_ID,
             "status": status,
             "phase": phase,
             "phase_number": phase_number,
-            "total_phases": 5,
+            "total_phases": TOTAL_PHASES,
             "message": message,
             "rows_processed": rows_processed,
             "updated_at": datetime.utcnow().isoformat(),
-            "triggered_by": TRIGGERED_BY
+            "triggered_by": TRIGGERED_BY,
         }
-        
+
         if error_message:
             data["error_message"] = error_message
         if duration_seconds:
             data["duration_seconds"] = round(duration_seconds, 2)
         if status == "completed" or status == "failed":
             data["completed_at"] = datetime.utcnow().isoformat()
-        
+
         response = requests.post(url, headers=headers, json=data)
         if response.status_code not in [200, 201]:
             log(f"Warning: Failed to update status: {response.text}", "WARN")
@@ -82,685 +162,468 @@ def update_status(status: str, phase: str = None, phase_number: int = 0,
         log(f"Warning: Could not update status: {e}", "WARN")
 
 
-def get_db_connection_string() -> str:
-    """Build postgres connection string for DuckDB"""
+def get_db_connection():
+    """Get psycopg2 connection to Supabase with keepalive settings"""
+    # Connection options for long-running queries
+    connect_options = {
+        "keepalives": 1,
+        "keepalives_idle": 30,      # Send keepalive after 30s idle
+        "keepalives_interval": 10,  # Retry every 10s
+        "keepalives_count": 5,      # Give up after 5 retries
+        "connect_timeout": 30,
+    }
+    
     if DATABASE_URL:
-        return DATABASE_URL
-    
-    # Fallback: construct from individual vars
-    db_host = os.getenv("DB_HOST", "db.pabqrixgzcnqttrkwkil.supabase.co")
-    db_port = os.getenv("DB_PORT", "5432")
-    db_name = os.getenv("DB_NAME", "postgres")
-    db_user = os.getenv("DB_USER", "postgres")
-    db_pass = SUPABASE_SERVICE_KEY or os.getenv("DB_PASSWORD", "")
-    
-    return f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+        conn = psycopg2.connect(DATABASE_URL, **connect_options)
+    else:
+        db_host = os.getenv("DB_HOST", "db.pabqrixgzcnqttrkwkil.supabase.co")
+        db_port = os.getenv("DB_PORT", "5432")
+        db_name = os.getenv("DB_NAME", "postgres")
+        db_user = os.getenv("DB_USER", "postgres")
+        db_pass = SUPABASE_SERVICE_KEY or os.getenv("DB_PASSWORD", "")
+
+        conn = psycopg2.connect(
+            host=db_host,
+            port=db_port,
+            database=db_name,
+            user=db_user,
+            password=db_pass,
+            **connect_options
+        )
+
+    conn.autocommit = True
+    return conn
 
 
-def run_test_mode():
-    """Test mode - just updates status without running rebuild"""
+def read_sql_file(filename: str) -> str:
+    """Read SQL file from sql/ directory"""
+    sql_path = SQL_DIR / filename
+    if not sql_path.exists():
+        raise FileNotFoundError(f"SQL file not found: {sql_path}")
+
+    with open(sql_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def replace_table_name(sql: str, from_table: str, to_table: str) -> str:
+    """Replace table name references in SQL for DRY_RUN mode."""
+    # Simple global replacement - works for most cases
+    result = sql.replace(from_table, to_table)
+    # Also replace index naming patterns
+    result = result.replace("idx_rtd_", "idx_rtdtest_")
+    return result
+
+
+def execute_sql(conn, sql: str, description: str = None) -> int:
+    """Execute SQL and return rows affected"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql)
+        rows = cursor.rowcount if cursor.rowcount > 0 else 0
+        return rows
+    except Exception as e:
+        log(f"SQL Error in {description}: {e}", "ERROR")
+        raise
+    finally:
+        cursor.close()
+
+
+def query_one(conn, sql: str):
+    """Execute a query and return single result"""
+    cursor = conn.cursor()
+    cursor.execute(sql)
+    result = cursor.fetchone()
+    cursor.close()
+    return result[0] if result else None
+
+
+def query_count(conn, table_name: str) -> int:
+    """Get row count of a table"""
+    return query_one(conn, f"SELECT COUNT(*) FROM {table_name}") or 0
+
+
+def run_phase(conn, phase_num: int, sql_file: str, description: str, target_table: str, total_phases: int = TOTAL_PHASES) -> dict:
+    """Execute a phase SQL file with progress indicator"""
+    phase_start = time.time()
+    
+    # Print phase header and progress bar
+    print_phase_progress(phase_num, total_phases, description)
+    log(f"{'=' * 60}")
+    log(f"PHASE {phase_num}: {description.upper()}")
+    log(f"{'=' * 60}")
+    update_status("transforming", f"Phase {phase_num}: {description}", phase_num, f"Running {sql_file}...")
+
+    try:
+        sql = read_sql_file(sql_file)
+        log(f"Loaded {sql_file} ({len(sql):,} bytes)")
+
+        # In DRY_RUN mode, replace table references
+        if DRY_RUN:
+            sql = replace_table_name(sql, PROD_TABLE_NAME, target_table)
+            log(f"DRY_RUN: Replaced '{PROD_TABLE_NAME}' -> '{target_table}'")
+
+        # Start spinner for SQL execution
+        spinner = ProgressSpinner(f"Executing {sql_file}")
+        spinner.start()
+        
+        # Execute the SQL
+        try:
+            rows = execute_sql(conn, sql, description)
+        finally:
+            spinner.stop(f"Executed {sql_file}")
+
+        duration = time.time() - phase_start
+
+        # Get current row count
+        row_count = query_count(conn, target_table)
+        
+        # Print success summary
+        mins, secs = divmod(int(duration), 60)
+        log(f"✅ Phase {phase_num} complete in {mins}m {secs}s ({row_count:,} rows)")
+
+        update_status("transforming", f"Phase {phase_num}: {description}", phase_num,
+                      f"Complete: {row_count:,} rows", row_count, duration_seconds=duration)
+
+        return {"phase": phase_num, "duration": duration, "rows": row_count, "success": True}
+
+    except Exception as e:
+        duration = time.time() - phase_start
+        mins, secs = divmod(int(duration), 60)
+        log(f"❌ Phase {phase_num} failed after {mins}m {secs}s: {e}", "ERROR")
+        update_status("failed", f"Phase {phase_num}: {description}", phase_num,
+                      error_message=str(e), duration_seconds=duration)
+        return {"phase": phase_num, "duration": duration, "error": str(e), "success": False}
+
+
+def setup_test_table(conn) -> int:
+    """Create test table from production for DRY_RUN mode"""
+    log("")
     log("=" * 60)
-    log("TEST MODE - Status API Test")
-    log(f"Run ID: {RUN_ID}")
+    log("DRY_RUN: Setting up test table")
     log("=" * 60)
-    
-    update_status("starting", "Test Mode", 0, "Testing status API...")
-    time.sleep(2)
-    
-    update_status("extracting", "Phase 1: Test", 1, "Simulating extraction...")
-    time.sleep(2)
-    
-    update_status("transforming", "Phase 2: Test", 2, "Simulating transform...")
-    time.sleep(2)
-    
-    update_status("transforming", "Phase 3: Test", 3, "Simulating career stats...")
-    time.sleep(2)
-    
-    update_status("transforming", "Phase 4: Test", 4, "Simulating advanced features...")
-    time.sleep(2)
-    
-    update_status("completed", "Complete", 5, "Test completed successfully!", 
-                  rows_processed=12345, duration_seconds=10.0)
-    
-    log("✅ Test mode completed - check rebuild_status table")
-    return {"status": "test_success", "rows": 12345}
+
+    cursor = conn.cursor()
+
+    # Drop existing test table
+    cursor.execute(f"DROP TABLE IF EXISTS {TEST_TABLE_NAME} CASCADE")
+    log(f"Dropped existing {TEST_TABLE_NAME} (if any)")
+
+    # Create test table as copy of production (2020+ data only)
+    log(f"Creating {TEST_TABLE_NAME} from production (2020+ data)...")
+    cursor.execute(f"""
+        CREATE TABLE {TEST_TABLE_NAME} AS
+        SELECT * FROM {PROD_TABLE_NAME}
+        WHERE race_date >= '2020-01-01'
+    """)
+
+    test_count = query_count(conn, TEST_TABLE_NAME)
+    log(f"Created {TEST_TABLE_NAME} with {test_count:,} rows")
+
+    # Add unique constraint for upsert operations
+    cursor.execute(f"""
+        ALTER TABLE {TEST_TABLE_NAME}
+        ADD CONSTRAINT {TEST_TABLE_NAME}_race_horse_key
+        UNIQUE (race_id, horse_slug)
+    """)
+    log("Added unique constraint (race_id, horse_slug)")
+
+    # Create essential indexes
+    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{TEST_TABLE_NAME}_race_id ON {TEST_TABLE_NAME}(race_id)")
+    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{TEST_TABLE_NAME}_horse_slug ON {TEST_TABLE_NAME}(horse_slug)")
+    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{TEST_TABLE_NAME}_race_date ON {TEST_TABLE_NAME}(race_date)")
+    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{TEST_TABLE_NAME}_horse_loc ON {TEST_TABLE_NAME}(horse_location_slug)")
+    log("Created indexes")
+
+    cursor.close()
+    return test_count
 
 
 def run_rebuild():
     """Main rebuild function"""
     start_time = time.time()
     log("=" * 60)
-    log("RACEALPHA TRAINING DATASET REBUILD - STARTING")
+    log("RACEALPHA TRAINING DATASET REBUILD V2 - STARTING")
     log(f"Run ID: {RUN_ID}")
+    log(f"DRY_RUN: {DRY_RUN}")
+    if DRY_RUN:
+        log(f"DRY RUN MODE: Operating on {TEST_TABLE_NAME}")
     log("=" * 60)
-    
+
+    # Determine target table
+    target_table = TEST_TABLE_NAME if DRY_RUN else PROD_TABLE_NAME
+
+    # Verify SQL files exist
+    required_sql_files = [
+        ("01_base_rebuild.sql", "Base Rebuild"),
+        ("02_career_form_stats.sql", "Career & Form Stats"),
+        ("03_advanced_features.sql", "Advanced Features"),
+        ("04_interactions_validation.sql", "Interactions & Validation"),
+        ("05_sectional_backfill.sql", "Sectional Backfill"),
+        ("06_sectional_pattern_features.sql", "Sectional Pattern Features"),
+        ("07_current_form_views.sql", "Current Form Views"),
+        ("08_elo_rebuild_and_sync.sql", "ELO Rebuild & Sync"),
+        ("08b_weather_features.sql", "Weather Track Preferences"),
+        ("09_remove_leakage_columns.sql", "Remove Leakage Columns"),
+    ]
+
+    log(f"Checking SQL files in {SQL_DIR}...")
+    missing_files = []
+    for f, _ in required_sql_files:
+        if not (SQL_DIR / f).exists():
+            missing_files.append(f)
+
+    if missing_files:
+        log(f"Missing SQL files: {missing_files}", "ERROR")
+        update_status("failed", "Initialization", 0, error_message=f"Missing SQL files: {missing_files}")
+        return {"status": "error", "message": f"Missing SQL files: {missing_files}"}
+
+    log(f"All {len(required_sql_files)} SQL files found")
+
     # Initial status update
     update_status("starting", "Initializing", 0, "Starting rebuild worker...")
-    
-    # Initialize DuckDB
-    log("Initializing DuckDB...")
-    con = duckdb.connect(":memory:")
-    
-    # Configure DuckDB for performance
-    con.execute(f"SET memory_limit = '{DUCKDB_MEMORY_LIMIT}'")
-    con.execute(f"SET threads = {DUCKDB_THREADS}")
-    con.execute("SET enable_progress_bar = true")
-    
-    # Install and load postgres extension
-    log("Loading PostgreSQL extension...")
-    con.execute("INSTALL postgres")
-    con.execute("LOAD postgres")
-    
+
     # Connect to Supabase
-    db_url = get_db_connection_string()
-    log("Connecting to Supabase PostgreSQL...")
-    
     try:
-        con.execute(f"""
-            ATTACH '{db_url}' AS supa (TYPE POSTGRES, READ_ONLY)
-        """)
-        log("✓ Connected to Supabase")
+        log("Connecting to Supabase PostgreSQL...")
+        conn = get_db_connection()
+        log("Connected to Supabase")
         update_status("starting", "Initializing", 0, "Connected to Supabase")
+
+        # Set session parameters for long-running queries
+        cursor = conn.cursor()
+        cursor.execute("SET statement_timeout = '0'")
+        cursor.execute("SET lock_timeout = '0'")
+        cursor.execute("SET work_mem = '512MB'")
+        cursor.execute("SET maintenance_work_mem = '1GB'")
+        cursor.close()
+        log("Session parameters set (no timeouts, 512MB work_mem)")
+
     except Exception as e:
-        log(f"✗ Failed to connect to Supabase: {e}", "ERROR")
+        log(f"Failed to connect to Supabase: {e}", "ERROR")
         update_status("failed", "Initializing", 0, error_message=str(e))
-        sys.exit(1)
-    
-    # ==========================================================================
-    # PHASE 1: EXTRACT SOURCE DATA
-    # ==========================================================================
-    phase_start = time.time()
+        return {"status": "error", "message": str(e)}
+
+    # Setup test table for DRY_RUN
+    if DRY_RUN:
+        try:
+            setup_test_table(conn)
+        except Exception as e:
+            log(f"Failed to setup test table: {e}", "ERROR")
+            update_status("failed", "DRY_RUN Setup", 0, error_message=str(e))
+            conn.close()
+            return {"status": "error", "message": str(e)}
+
+    # Execute phases
+    results = []
+
+    for i, (sql_file, description) in enumerate(required_sql_files, start=1):
+        # Skip views in DRY_RUN (they reference production table)
+        if DRY_RUN and "views" in sql_file.lower():
+            log(f"Skipping Phase {i} ({description}) in DRY_RUN mode")
+            results.append({"phase": i, "skipped": True, "success": True})
+            continue
+
+        result = run_phase(conn, i, sql_file, description, target_table)
+        results.append(result)
+
+        if not result["success"]:
+            # For non-critical phases (ELO, Views), log warning and continue
+            if i >= 7:
+                log(f"Warning: Phase {i} failed but continuing...", "WARN")
+            else:
+                conn.close()
+                return {"status": "error", "phase": i, "error": result.get("error")}
+
+    # Final validation
     log("")
     log("=" * 60)
-    log("PHASE 1: EXTRACT SOURCE DATA")
+    log("PHASE 9: FINAL VALIDATION")
     log("=" * 60)
-    update_status("extracting", "Phase 1: Extract", 1, "Extracting source tables from Supabase...")
-    
-    log("Extracting races table...")
-    con.execute("""
-        CREATE TABLE races AS 
-        SELECT * FROM supa.public.races
-        WHERE race_date >= '2020-01-01'
+    update_status("validating", "Phase 9: Validation", 9, "Running final validation...")
+
+    cursor = conn.cursor()
+
+    # Get final counts and stats
+    final_count = query_count(conn, target_table)
+
+    cursor.execute(f"SELECT COUNT(DISTINCT horse_slug) FROM {target_table}")
+    unique_horses = cursor.fetchone()[0]
+
+    cursor.execute(f"SELECT MIN(race_date), MAX(race_date) FROM {target_table}")
+    date_range = cursor.fetchone()
+
+    cursor.execute(f"""
+        SELECT
+            ROUND(COUNT(*) FILTER (WHERE position_800m IS NOT NULL) * 100.0 / NULLIF(COUNT(*), 0), 1) as sectional_coverage,
+            ROUND(COUNT(*) FILTER (WHERE running_style IS NOT NULL AND running_style != 'unknown') * 100.0 / NULLIF(COUNT(*), 0), 1) as running_style_coverage
+        FROM {target_table}
     """)
-    races_count = con.execute("SELECT COUNT(*) FROM races").fetchone()[0]
-    log(f"  ✓ races: {races_count:,} rows")
-    
-    log("Extracting race_results table...")
-    update_status("extracting", "Phase 1: Extract", 1, f"Extracted {races_count:,} races, now extracting results...")
-    con.execute("""
-        CREATE TABLE race_results AS 
-        SELECT * FROM supa.public.race_results
-        WHERE race_id IN (SELECT race_id FROM races)
+    coverage = cursor.fetchone()
+
+    # Count columns
+    cursor.execute(f"""
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_name = '{target_table}'
     """)
-    results_count = con.execute("SELECT COUNT(*) FROM race_results").fetchone()[0]
-    log(f"  ✓ race_results: {results_count:,} rows")
+    column_count = cursor.fetchone()[0]
+
+    cursor.close()
+
+    log(f"Final row count: {final_count:,}")
+    log(f"Unique horses: {unique_horses:,}")
+    log(f"Date range: {date_range[0]} to {date_range[1]}")
+    log(f"Sectional coverage: {coverage[0]}%")
+    log(f"Running style coverage: {coverage[1]}%")
+    log(f"Total columns: {column_count}")
+
+    # Complete
+    total_duration = time.time() - start_time
+    total_mins, total_secs = divmod(int(total_duration), 60)
+
+    # Print final summary with phase breakdown
+    print("\n")
+    print("=" * 60)
+    print("🏁 REBUILD COMPLETE!")
+    print("=" * 60)
     
-    log("Extracting sectional times...")
-    update_status("extracting", "Phase 1: Extract", 1, f"Extracted {results_count:,} results, now extracting sectionals...")
-    con.execute("""
-        CREATE TABLE race_results_sectional_times AS 
-        SELECT * FROM supa.public.race_results_sectional_times
-        WHERE race_id IN (SELECT race_id FROM races)
-    """)
-    sectional_count = con.execute("SELECT COUNT(*) FROM race_results_sectional_times").fetchone()[0]
-    log(f"  ✓ race_results_sectional_times: {sectional_count:,} rows")
+    if DRY_RUN:
+        print(f"📋 Mode: DRY RUN (test table: {TEST_TABLE_NAME})")
+    else:
+        print(f"📋 Mode: PRODUCTION")
     
-    log(f"Phase 1 complete in {time.time() - phase_start:.1f}s")
-    update_status("extracting", "Phase 1: Extract", 1, f"Complete: {races_count:,} races, {results_count:,} results, {sectional_count:,} sectionals")
+    print(f"\n📊 Final Statistics:")
+    print(f"   • Total rows:      {final_count:,}")
+    print(f"   • Total columns:   {column_count}")
+    print(f"   • Unique horses:   {unique_horses:,}")
+    print(f"   • Date range:      {date_range[0]} to {date_range[1]}")
+    print(f"   • Sectionals:      {coverage[0]}%")
+    print(f"   • Running style:   {coverage[1]}%")
     
-    # ==========================================================================
-    # PHASE 2: BASE REBUILD
-    # ==========================================================================
-    phase_start = time.time()
-    log("")
-    log("=" * 60)
-    log("PHASE 2: BASE REBUILD")
-    log("=" * 60)
-    update_status("transforming", "Phase 2: Base Rebuild", 2, "Creating base training dataset...")
+    print(f"\n⏱️  Phase Timing:")
+    for r in results:
+        if r.get("skipped"):
+            print(f"   Phase {r['phase']:2d}: ⏭️  Skipped")
+        elif r.get("success"):
+            mins, secs = divmod(int(r.get('duration', 0)), 60)
+            print(f"   Phase {r['phase']:2d}: ✅ {mins:2d}m {secs:02d}s ({r.get('rows', 0):,} rows)")
+        else:
+            print(f"   Phase {r['phase']:2d}: ❌ Failed - {r.get('error', 'Unknown')[:50]}")
     
-    # Fix location data
-    log("Fixing location data...")
-    con.execute("""
-        UPDATE races SET location = CASE
-            WHEN track_name IN ('Sha Tin', 'Happy Valley') THEN 'HK'
-            WHEN track_name IN (
-                'Royal Ascot', 'Newmarket', 'Epsom Downs', 'York', 'Goodwood',
-                'Cheltenham', 'Aintree', 'Newbury', 'Sandown Park', 'Doncaster', 
-                'Haydock', 'Kempton', 'Wolverhampton', 'Southwell', 'Lingfield', 
-                'Chester', 'Hamilton', 'Musselburgh', 'Nottingham', 'Pontefract', 
-                'Sedgefield', 'Plumpton', 'Yarmouth', 'Down Royal'
-            ) THEN 'UK'
-            WHEN track_name IN (
-                'Curragh', 'Leopardstown', 'Punchestown', 'Fairyhouse', 'Naas',
-                'Gowran Park', 'Galway', 'Cork', 'Killarney', 'Dundalk', 'Navan', 'Thurles'
-            ) THEN 'IE'
-            WHEN track_name IN (
-                'ParisLongchamp', 'Chantilly', 'Deauville', 'Saint-Cloud',
-                'Compiegne', 'Fontainebleau', 'Lyon-Parilly', 'Vichy'
-            ) THEN 'FR'
-            WHEN track_name IN (
-                'Tokyo', 'Kyoto', 'Hanshin', 'Nakayama', 'Chukyo',
-                'Niigata', 'Fukushima', 'Kokura', 'Sapporo'
-            ) THEN 'JP'
-            WHEN track_name = 'Meydan' THEN 'AE'
-            ELSE 'AU'
-        END
-        WHERE track_name IS NOT NULL
-    """)
-    
-    # Create base training dataset
-    log("Creating base training dataset...")
-    con.execute("""
-        CREATE TABLE race_training_dataset AS
-        SELECT 
-            rr.race_id,
-            r.race_date,
-            r.race_number,
-            r.track_name,
-            r.race_distance,
-            r.race_class,
-            r.track_condition,
-            r.total_prize_money AS prize_money,
-            COALESCE(r.location, 'AU') AS location,
-            
-            -- Horse info
-            rr.horse_name,
-            rr.horse_slug,
-            rr.horse_slug || '_' || COALESCE(r.location, 'AU') AS horse_location_slug,
-            rr.barrier,
-            rr.original_weight AS weight_carried,
-            rr.horse_number,
-            
-            -- Jockey/Trainer
-            rr.jockey_name,
-            rr.jockey_slug,
-            rr.jockey_slug || '_' || COALESCE(r.location, 'AU') AS jockey_location_slug,
-            rr.trainer_name,
-            rr.trainer_slug,
-            rr.trainer_slug || '_' || COALESCE(r.location, 'AU') AS trainer_location_slug,
-            
-            -- Result data
-            rr.position AS final_position,
-            rr.margin,
-            rr.win_odds,
-            rr.raw_time_seconds,
-            
-            -- Sectional positions (will be backfilled later)
-            rr.position_800m,
-            rr.position_400m,
-            
-            -- Placeholder columns to be filled
-            CAST(NULL AS INTEGER) AS total_runners,
-            CAST(NULL AS INTEGER) AS total_races,
-            CAST(NULL AS INTEGER) AS wins,
-            CAST(NULL AS INTEGER) AS places,
-            CAST(NULL AS DOUBLE) AS win_percentage,
-            CAST(NULL AS DOUBLE) AS place_percentage,
-            CAST(NULL AS INTEGER) AS days_since_last_race,
-            CAST(NULL AS DOUBLE) AS last_5_avg_position,
-            CAST(NULL AS DOUBLE) AS last_5_win_rate,
-            CAST(NULL AS DOUBLE) AS last_5_place_rate,
-            CAST(NULL AS DOUBLE) AS form_momentum,
-            CAST(NULL AS DOUBLE) AS form_recency_score,
-            CAST(NULL AS INTEGER) AS horse_elo,
-            CAST(NULL AS BOOLEAN) AS is_elo_default,
-            CAST(NULL AS DOUBLE) AS jockey_win_rate,
-            CAST(NULL AS DOUBLE) AS jockey_place_rate,
-            CAST(NULL AS INTEGER) AS jockey_total_rides,
-            CAST(NULL AS DOUBLE) AS trainer_win_rate,
-            CAST(NULL AS DOUBLE) AS trainer_place_rate,
-            CAST(NULL AS INTEGER) AS trainer_total_runners,
-            CAST(NULL AS VARCHAR) AS running_style,
-            CAST(NULL AS INTEGER) AS class_rating,
-            CAST(NULL AS VARCHAR) AS track_direction,
-            CAST(NULL AS VARCHAR) AS track_category,
-            CAST(NULL AS VARCHAR) AS distance_range,
-            CAST(NULL AS VARCHAR) AS barrier_position,
-            CAST(NULL AS BOOLEAN) AS is_maiden,
-            CAST(NULL AS BOOLEAN) AS is_handicap,
-            CAST(NULL AS BOOLEAN) AS is_first_timer,
-            CAST(NULL AS BOOLEAN) AS is_cross_region_horse,
-            CAST(NULL AS BOOLEAN) AS never_placed_flag,
-            CAST(NULL AS DOUBLE) AS elo_percentile_in_race,
-            CAST(NULL AS DOUBLE) AS odds_percentile_in_race,
-            CAST(NULL AS BOOLEAN) AS is_favorite,
-            CAST(NULL AS DOUBLE) AS odds_implied_probability,
-            CAST(NULL AS BOOLEAN) AS is_longshot,
-            CAST(NULL AS INTEGER) AS pos_improvement_800_finish,
-            
-            -- Timestamps
-            CURRENT_TIMESTAMP AS created_at,
-            CURRENT_TIMESTAMP AS updated_at
-            
-        FROM race_results rr
-        JOIN races r ON rr.race_id = r.race_id
-        WHERE rr.horse_slug IS NOT NULL 
-          AND rr.position IS NOT NULL 
-          AND rr.position < 50
-    """)
-    
-    base_count = con.execute("SELECT COUNT(*) FROM race_training_dataset").fetchone()[0]
-    log(f"  ✓ Base dataset: {base_count:,} rows")
-    
-    # Calculate total runners per race
-    log("Calculating total runners per race...")
-    con.execute("""
-        WITH field_sizes AS (
-            SELECT race_id, COUNT(*) AS field_size 
-            FROM race_training_dataset 
-            GROUP BY race_id
-        )
-        UPDATE race_training_dataset rtd
-        SET total_runners = fs.field_size
-        FROM field_sizes fs
-        WHERE rtd.race_id = fs.race_id
-    """)
-    
-    # Set track properties
-    log("Setting track properties...")
-    con.execute("""
-        UPDATE race_training_dataset SET 
-            track_direction = CASE
-                WHEN track_name IN ('Flemington', 'Caulfield', 'Moonee Valley', 'Sandown Lakeside', 
-                    'Ballarat', 'Bendigo', 'Geelong', 'Mornington', 'Pakenham Synthetic',
-                    'Randwick', 'Rosehill', 'Canterbury Park', 'Warwick Farm', 'Newcastle',
-                    'Eagle Farm', 'Doomben', 'Sunshine Coast', 'Gold Coast',
-                    'Sha Tin', 'Happy Valley') THEN 'Clockwise'
-                ELSE 'Anti-Clockwise'
-            END,
-            track_category = CASE
-                WHEN track_name IN ('Flemington', 'Caulfield', 'Moonee Valley', 'Randwick', 
-                    'Rosehill', 'Eagle Farm', 'Doomben', 'Morphettville',
-                    'Sha Tin', 'Happy Valley') THEN 'Metro'
-                WHEN track_name IN ('Sandown Lakeside', 'Sandown Hillside', 'Cranbourne',
-                    'Canterbury Park', 'Warwick Farm', 'Newcastle', 'Kembla Grange',
-                    'Sunshine Coast', 'Gold Coast', 'Ipswich') THEN 'Provincial'
-                ELSE 'Country'
-            END
-    """)
-    
-    # Set race class flags
-    log("Setting race class flags...")
-    con.execute("""
-        UPDATE race_training_dataset SET 
-            is_maiden = (race_class ILIKE '%maiden%'),
-            is_handicap = (race_class ILIKE '%handicap%' OR race_class ILIKE '%hcp%')
-    """)
-    
-    # Distance range categorization
-    log("Categorizing distance ranges...")
-    con.execute("""
-        UPDATE race_training_dataset SET distance_range = CASE
-            WHEN race_distance < 1000 THEN 'Sprint (<1000m)'
-            WHEN race_distance < 1400 THEN 'Speed (1000-1399m)'
-            WHEN race_distance < 1800 THEN 'Mile (1400-1799m)'
-            WHEN race_distance < 2200 THEN 'Middle (1800-2199m)'
-            ELSE 'Staying (2200m+)'
-        END WHERE race_distance IS NOT NULL
-    """)
-    
-    # Barrier position classification
-    log("Classifying barrier positions...")
-    con.execute("""
-        UPDATE race_training_dataset SET barrier_position = CASE
-            WHEN total_runners IS NULL OR total_runners = 0 THEN 'unknown'
-            WHEN barrier::float / total_runners <= 0.33 THEN 'inner'
-            WHEN barrier::float / total_runners <= 0.66 THEN 'middle'
-            ELSE 'outer'
-        END WHERE barrier IS NOT NULL
-    """)
-    
-    log(f"Phase 2 complete in {time.time() - phase_start:.1f}s")
-    
-    # ==========================================================================
-    # PHASE 3: CAREER & FORM STATS
-    # ==========================================================================
-    phase_start = time.time()
-    log("")
-    log("=" * 60)
-    log("PHASE 3: CAREER & FORM STATS (Anti-leakage)")
-    log("=" * 60)
-    update_status("transforming", "Phase 3: Career Stats", 3, "Calculating career and form statistics...")
-    
-    # Horse career stats with anti-leakage window
-    log("Calculating horse career stats...")
-    con.execute("""
-        WITH horse_career AS (
-            SELECT 
-                race_id,
-                horse_location_slug,
-                COUNT(*) OVER w_prior AS prior_races,
-                SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END) OVER w_prior AS prior_wins,
-                SUM(CASE WHEN final_position <= 3 THEN 1 ELSE 0 END) OVER w_prior AS prior_places,
-                LAG(race_date) OVER w_order AS prev_date
-            FROM race_training_dataset
-            WHERE final_position IS NOT NULL AND horse_location_slug IS NOT NULL
-            WINDOW 
-                w_prior AS (PARTITION BY horse_location_slug ORDER BY race_date, race_id 
-                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
-                w_order AS (PARTITION BY horse_location_slug ORDER BY race_date, race_id)
-        )
-        UPDATE race_training_dataset rtd SET 
-            total_races = COALESCE(hc.prior_races, 0),
-            wins = COALESCE(hc.prior_wins, 0),
-            places = COALESCE(hc.prior_places, 0),
-            win_percentage = CASE 
-                WHEN COALESCE(hc.prior_races, 0) > 0 
-                THEN ROUND(hc.prior_wins::numeric / hc.prior_races * 100, 2) 
-                ELSE 0 
-            END,
-            place_percentage = CASE 
-                WHEN COALESCE(hc.prior_races, 0) > 0 
-                THEN ROUND(hc.prior_places::numeric / hc.prior_races * 100, 2) 
-                ELSE 0 
-            END,
-            is_first_timer = (COALESCE(hc.prior_races, 0) = 0),
-            days_since_last_race = CASE 
-                WHEN hc.prev_date IS NOT NULL 
-                THEN (rtd.race_date - hc.prev_date)::integer 
-                ELSE NULL 
-            END
-        FROM horse_career hc
-        WHERE rtd.race_id = hc.race_id AND rtd.horse_location_slug = hc.horse_location_slug
-    """)
-    
-    # Last 5 race stats
-    log("Calculating last 5 race stats...")
-    con.execute("""
-        WITH l5 AS (
-            SELECT 
-                race_id,
-                horse_location_slug,
-                COUNT(*) OVER w AS cnt,
-                AVG(final_position) OVER w AS avg_pos,
-                SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END) OVER w AS l5_wins,
-                SUM(CASE WHEN final_position <= 3 THEN 1 ELSE 0 END) OVER w AS l5_places
-            FROM race_training_dataset
-            WHERE final_position IS NOT NULL AND final_position < 50
-            WINDOW w AS (PARTITION BY horse_location_slug ORDER BY race_date, race_id
-                        ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING)
-        )
-        UPDATE race_training_dataset rtd SET 
-            last_5_avg_position = ROUND(l5.avg_pos, 2),
-            last_5_win_rate = CASE WHEN l5.cnt > 0 THEN ROUND(l5.l5_wins::numeric / LEAST(l5.cnt, 5), 4) ELSE 0 END,
-            last_5_place_rate = CASE WHEN l5.cnt > 0 THEN ROUND(l5.l5_places::numeric / LEAST(l5.cnt, 5), 4) ELSE 0 END
-        FROM l5
-        WHERE rtd.race_id = l5.race_id AND rtd.horse_location_slug = l5.horse_location_slug
-    """)
-    
-    # Form recency score
-    log("Calculating form recency score...")
-    con.execute("""
-        UPDATE race_training_dataset SET form_recency_score = CASE
-            WHEN days_since_last_race IS NULL THEN 0.5
-            WHEN days_since_last_race <= 14 THEN 1.0
-            WHEN days_since_last_race <= 28 THEN 0.9
-            WHEN days_since_last_race <= 60 THEN 0.6
-            ELSE 0.3
-        END
-    """)
-    
-    # Form momentum
-    log("Calculating form momentum...")
-    con.execute("""
-        UPDATE race_training_dataset SET form_momentum = CASE
-            WHEN last_5_avg_position IS NULL THEN 0
-            WHEN last_5_avg_position <= 2 THEN 1.0
-            WHEN last_5_avg_position <= 4 THEN 0.7
-            WHEN last_5_avg_position <= 6 THEN 0.4
-            ELSE 0.1
-        END
-    """)
-    
-    # ELO ratings
-    log("Calculating ELO ratings...")
-    con.execute("""
-        UPDATE race_training_dataset SET 
-            horse_elo = ROUND(LEAST(GREATEST(
-                1500 + COALESCE(win_percentage, 0) * 5 + LEAST(COALESCE(total_races, 0), 50) * 2, 
-                1200
-            ), 2000), 0),
-            is_elo_default = (total_races = 0 OR total_races IS NULL)
-    """)
-    
-    # Jockey stats
-    log("Calculating jockey stats...")
-    con.execute("""
-        WITH js AS (
-            SELECT 
-                race_id,
-                jockey_location_slug,
-                COUNT(*) OVER w AS rides,
-                SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END) OVER w AS wins,
-                SUM(CASE WHEN final_position <= 3 THEN 1 ELSE 0 END) OVER w AS places
-            FROM race_training_dataset
-            WHERE jockey_location_slug IS NOT NULL
-            WINDOW w AS (PARTITION BY jockey_location_slug ORDER BY race_date, race_id 
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
-        )
-        UPDATE race_training_dataset rtd SET 
-            jockey_win_rate = CASE WHEN COALESCE(js.rides, 0) > 0 THEN ROUND(js.wins::numeric / js.rides, 4) ELSE 0 END,
-            jockey_place_rate = CASE WHEN COALESCE(js.rides, 0) > 0 THEN ROUND(js.places::numeric / js.rides, 4) ELSE 0 END,
-            jockey_total_rides = COALESCE(js.rides, 0)
-        FROM js
-        WHERE rtd.race_id = js.race_id AND rtd.jockey_location_slug = js.jockey_location_slug
-    """)
-    
-    # Trainer stats
-    log("Calculating trainer stats...")
-    con.execute("""
-        WITH ts AS (
-            SELECT 
-                race_id,
-                trainer_location_slug,
-                COUNT(*) OVER w AS runners,
-                SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END) OVER w AS wins,
-                SUM(CASE WHEN final_position <= 3 THEN 1 ELSE 0 END) OVER w AS places
-            FROM race_training_dataset
-            WHERE trainer_location_slug IS NOT NULL
-            WINDOW w AS (PARTITION BY trainer_location_slug ORDER BY race_date, race_id 
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
-        )
-        UPDATE race_training_dataset rtd SET 
-            trainer_win_rate = CASE WHEN COALESCE(ts.runners, 0) > 0 THEN ROUND(ts.wins::numeric / ts.runners, 4) ELSE 0 END,
-            trainer_place_rate = CASE WHEN COALESCE(ts.runners, 0) > 0 THEN ROUND(ts.places::numeric / ts.runners, 4) ELSE 0 END,
-            trainer_total_runners = COALESCE(ts.runners, 0)
-        FROM ts
-        WHERE rtd.race_id = ts.race_id AND rtd.trainer_location_slug = ts.trainer_location_slug
-    """)
-    
-    # Cross-region flags
-    log("Setting cross-region flags...")
-    con.execute("""
-        WITH multi_region AS (
-            SELECT horse_slug 
-            FROM race_training_dataset 
-            GROUP BY horse_slug 
-            HAVING COUNT(DISTINCT location) > 1
-        )
-        UPDATE race_training_dataset rtd 
-        SET is_cross_region_horse = TRUE 
-        FROM multi_region mr 
-        WHERE rtd.horse_slug = mr.horse_slug
-    """)
-    con.execute("UPDATE race_training_dataset SET is_cross_region_horse = FALSE WHERE is_cross_region_horse IS NULL")
-    con.execute("UPDATE race_training_dataset SET never_placed_flag = (total_races > 0 AND places = 0)")
-    
-    log(f"Phase 3 complete in {time.time() - phase_start:.1f}s")
-    update_status("transforming", "Phase 3: Career Stats", 3, "Complete: Career stats, ELO, jockey/trainer rates calculated")
-    
-    # ==========================================================================
-    # PHASE 4: ADVANCED FEATURES
-    # ==========================================================================
-    phase_start = time.time()
-    log("")
-    log("=" * 60)
-    log("PHASE 4: ADVANCED FEATURES")
-    log("=" * 60)
-    update_status("transforming", "Phase 4: Advanced Features", 4, "Calculating running style, class ratings, field percentiles...")
-    
-    # Position improvement
-    log("Calculating position improvements...")
-    con.execute("""
-        UPDATE race_training_dataset SET 
-            pos_improvement_800_finish = CASE 
-                WHEN position_800m IS NOT NULL AND final_position IS NOT NULL 
-                THEN position_800m - final_position 
-                ELSE NULL 
-            END
-    """)
-    
-    # Running style
-    log("Classifying running styles...")
-    con.execute("""
-        UPDATE race_training_dataset SET running_style = CASE
-            WHEN position_800m IS NULL THEN 'unknown'
-            WHEN position_800m <= 2 THEN 'leader'
-            WHEN position_800m <= 4 THEN 'stalker'
-            WHEN position_800m <= total_runners * 0.6 THEN 'midfield'
-            ELSE 'closer'
-        END
-    """)
-    
-    # Class rating
-    log("Setting class ratings...")
-    con.execute("""
-        UPDATE race_training_dataset SET class_rating = CASE
-            WHEN race_class ILIKE '%group 1%' THEN 100
-            WHEN race_class ILIKE '%group 2%' THEN 90
-            WHEN race_class ILIKE '%group 3%' THEN 80
-            WHEN race_class ILIKE '%listed%' THEN 70
-            WHEN race_class ILIKE '%benchmark%' OR race_class ILIKE '%bm%' THEN 55
-            WHEN track_category = 'Metro' THEN 45
-            WHEN track_category = 'Provincial' THEN 35
-            ELSE 25
-        END
-    """)
-    
-    # Field percentiles
-    log("Calculating field percentiles...")
-    con.execute("""
-        WITH rp AS (
-            SELECT 
-                race_id, 
-                horse_slug,
-                PERCENT_RANK() OVER (PARTITION BY race_id ORDER BY horse_elo DESC) AS elo_pct,
-                PERCENT_RANK() OVER (PARTITION BY race_id ORDER BY win_odds ASC) AS odds_pct,
-                ROW_NUMBER() OVER (PARTITION BY race_id ORDER BY win_odds ASC) AS odds_rank
-            FROM race_training_dataset
-        )
-        UPDATE race_training_dataset rtd SET 
-            elo_percentile_in_race = ROUND(rp.elo_pct, 4),
-            odds_percentile_in_race = ROUND(rp.odds_pct, 4),
-            is_favorite = (rp.odds_rank = 1)
-        FROM rp
-        WHERE rtd.race_id = rp.race_id AND rtd.horse_slug = rp.horse_slug
-    """)
-    
-    # Odds features
-    log("Calculating odds features...")
-    con.execute("""
-        UPDATE race_training_dataset SET 
-            odds_implied_probability = CASE WHEN win_odds > 0 THEN ROUND(1.0 / win_odds, 4) ELSE NULL END,
-            is_longshot = (win_odds > 20)
-    """)
-    
-    log(f"Phase 4 complete in {time.time() - phase_start:.1f}s")
-    update_status("transforming", "Phase 4: Advanced Features", 4, "Complete: Running styles, class ratings, odds features calculated")
-    
-    # ==========================================================================
-    # PHASE 5: EXPORT TO SUPABASE
-    # ==========================================================================
-    phase_start = time.time()
-    log("")
-    log("=" * 60)
-    log("PHASE 5: EXPORT TO SUPABASE")
-    log("=" * 60)
-    update_status("loading", "Phase 5: Export", 5, "Writing results back to Supabase...")
-    
-    final_count = con.execute("SELECT COUNT(*) FROM race_training_dataset").fetchone()[0]
-    log(f"Final dataset: {final_count:,} rows")
-    
-    # Export to Parquet first (for backup)
-    log("Exporting to Parquet backup...")
-    con.execute("COPY race_training_dataset TO 'training_dataset_backup.parquet' (FORMAT PARQUET)")
-    
-    # Write back to Supabase shadow table
-    log("Writing to Supabase shadow table...")
-    try:
-        # Detach read-only and reattach with write access
-        con.execute("DETACH supa")
-        con.execute(f"""
-            ATTACH '{db_url}' AS supa (TYPE POSTGRES)
-        """)
-        
-        # Drop existing shadow table
-        con.execute("DROP TABLE IF EXISTS supa.public.race_training_dataset_shadow")
-        
-        # Create shadow table from our data
-        con.execute("""
-            CREATE TABLE supa.public.race_training_dataset_shadow AS 
-            SELECT * FROM race_training_dataset
-        """)
-        
-        log("✓ Shadow table created")
-        
-        # Atomic swap would need to be done via SQL on Supabase side
-        log("NOTE: Run atomic swap on Supabase to complete:")
-        log("  ALTER TABLE race_training_dataset RENAME TO race_training_dataset_old;")
-        log("  ALTER TABLE race_training_dataset_shadow RENAME TO race_training_dataset;")
-        
-    except Exception as e:
-        log(f"✗ Failed to write to Supabase: {e}", "ERROR")
-        log("Parquet backup available: training_dataset_backup.parquet")
-        sys.exit(1)
-    
-    log(f"Phase 5 complete in {time.time() - phase_start:.1f}s")
-    
-    # ==========================================================================
-    # SUMMARY
-    # ==========================================================================
-    total_time = time.time() - start_time
-    log("")
-    log("=" * 60)
-    log("REBUILD COMPLETE")
-    log("=" * 60)
-    log(f"Total rows: {final_count:,}")
-    log(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
-    log("=" * 60)
-    
-    # Final success status
-    update_status(
-        "completed", 
-        "Complete", 
-        5, 
-        f"Successfully rebuilt {final_count:,} rows in {total_time/60:.1f} minutes",
-        rows_processed=final_count,
-        duration_seconds=total_time
-    )
-    
+    print(f"\n⏱️  Total Duration: {total_mins}m {total_secs}s")
+    print(f"🔑 Run ID: {RUN_ID}")
+    print("=" * 60)
+
+    update_status("completed", "Complete", TOTAL_PHASES,
+                  f"Rebuild complete: {final_count:,} rows, {column_count} columns",
+                  final_count, duration_seconds=total_duration)
+
+    conn.close()
+
     return {
         "status": "success",
+        "dry_run": DRY_RUN,
+        "table": target_table,
         "rows": final_count,
-        "duration_seconds": round(total_time, 1)
+        "columns": column_count,
+        "unique_horses": unique_horses,
+        "date_range": [str(date_range[0]), str(date_range[1])],
+        "sectional_coverage": coverage[0],
+        "running_style_coverage": coverage[1],
+        "duration_minutes": round(total_duration / 60, 1),
+        "run_id": RUN_ID
     }
 
 
-# Check for TEST_MODE environment variable
-TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
+def run_test_mode():
+    """Test mode - validates connection and SQL files without running rebuild"""
+    log("=" * 60)
+    log("TEST MODE - Validating Setup")
+    log(f"Run ID: {RUN_ID}")
+    log("=" * 60)
+
+    # Check SQL files
+    required_sql_files = [
+        "01_base_rebuild.sql",
+        "02_career_form_stats.sql",
+        "03_advanced_features.sql",
+        "04_interactions_validation.sql",
+        "05_sectional_backfill.sql",
+        "06_sectional_pattern_features.sql",
+        "07_current_form_views.sql",
+        "08_elo_rebuild_and_sync.sql",
+        "08b_weather_features.sql",
+        "09_remove_leakage_columns.sql",
+    ]
+
+    log(f"SQL Directory: {SQL_DIR}")
+    all_found = True
+    total_lines = 0
+
+    for f in required_sql_files:
+        path = SQL_DIR / f
+        if path.exists():
+            with open(path, 'r') as file:
+                lines = len(file.readlines())
+                total_lines += lines
+            log(f"  {f} ({lines} lines)")
+        else:
+            log(f"  {f} MISSING", "ERROR")
+            all_found = False
+
+    if not all_found:
+        log("")
+        log("Some SQL files are missing!", "ERROR")
+        return {"status": "error", "message": "Missing SQL files"}
+
+    log(f"")
+    log(f"Total SQL: {total_lines:,} lines")
+
+    # Test database connection
+    log("")
+    log("Testing database connection...")
+    try:
+        conn = get_db_connection()
+
+        # Get production table info
+        prod_count = query_count(conn, PROD_TABLE_NAME)
+
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM information_schema.columns
+            WHERE table_name = '{PROD_TABLE_NAME}'
+        """)
+        col_count = cursor.fetchone()[0]
+        cursor.close()
+
+        conn.close()
+
+        log(f"Connected to Supabase")
+        log(f"Production table: {prod_count:,} rows, {col_count} columns")
+
+    except Exception as e:
+        log(f"Connection failed: {e}", "ERROR")
+        return {"status": "error", "message": str(e)}
+
+    log("")
+    log("All checks passed - ready for rebuild")
+
+    return {"status": "success", "sql_lines": total_lines, "production_rows": prod_count, "production_columns": col_count}
 
 
 if __name__ == "__main__":
-    try:
-        if TEST_MODE:
-            result = run_test_mode()
-            print(f"\n✅ Test mode completed: {result}")
-        else:
-            result = run_rebuild()
-            print(f"\n✅ Rebuild completed successfully: {result}")
-    except Exception as e:
-        update_status("failed", "Error", 0, error_message=str(e))
-        log(f"FATAL ERROR: {e}", "ERROR")
-        import traceback
-        traceback.print_exc()
+    mode = os.getenv("MODE", "rebuild").lower()
+
+    if mode == "test":
+        result = run_test_mode()
+    else:
+        result = run_rebuild()
+
+    print(f"\n{'='*60}")
+    print(f"RESULT: {result}")
+    print(f"{'='*60}")
+
+    # Exit with appropriate code
+    if result.get("status") == "error":
         sys.exit(1)
+    sys.exit(0)
