@@ -663,7 +663,7 @@ SET
     track_distance_experience = COALESCE(tde.exp, 0),
     track_distance_win_rate_weighted = CASE 
         WHEN COALESCE(tde.exp, 0) > 0 
-        THEN ROUND(tde.wins::numeric / tde.exp * (1 + LN(tde.exp + 1) / 5), 4)
+        THEN ROUND((tde.wins::numeric / tde.exp * (1 + LN(tde.exp + 1) / 5))::numeric, 4)
         ELSE 0 
     END
 FROM track_dist_exp tde
