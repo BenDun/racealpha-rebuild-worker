@@ -31,11 +31,116 @@
     -- ============================================================================
     DO $$ 
     BEGIN
+        -- raw_time_seconds
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                        WHERE table_name = 'race_training_dataset' 
                        AND column_name = 'raw_time_seconds') THEN
             ALTER TABLE race_training_dataset ADD COLUMN raw_time_seconds NUMERIC(10,3);
             RAISE NOTICE 'Added missing column: raw_time_seconds';
+        END IF;
+        
+        -- speed_figure
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'speed_figure') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN speed_figure NUMERIC(8,2);
+            RAISE NOTICE 'Added missing column: speed_figure';
+        END IF;
+        
+        -- avg_speed_figure
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'avg_speed_figure') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN avg_speed_figure NUMERIC(8,2);
+            RAISE NOTICE 'Added missing column: avg_speed_figure';
+        END IF;
+        
+        -- best_speed_figure
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'best_speed_figure') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN best_speed_figure NUMERIC(8,2);
+            RAISE NOTICE 'Added missing column: best_speed_figure';
+        END IF;
+        
+        -- class_rating
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'class_rating') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN class_rating INTEGER;
+            RAISE NOTICE 'Added missing column: class_rating';
+        END IF;
+        
+        -- class_change
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'class_change') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN class_change INTEGER;
+            RAISE NOTICE 'Added missing column: class_change';
+        END IF;
+        
+        -- class_drop
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'class_drop') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN class_drop BOOLEAN;
+            RAISE NOTICE 'Added missing column: class_drop';
+        END IF;
+        
+        -- class_rise
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'class_rise') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN class_rise BOOLEAN;
+            RAISE NOTICE 'Added missing column: class_rise';
+        END IF;
+        
+        -- running_style
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'running_style') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN running_style VARCHAR(20);
+            RAISE NOTICE 'Added missing column: running_style';
+        END IF;
+        
+        -- total_connection_score
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'total_connection_score') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN total_connection_score NUMERIC(8,4);
+            RAISE NOTICE 'Added missing column: total_connection_score';
+        END IF;
+        
+        -- jockey_track_win_rate
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'jockey_track_win_rate') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN jockey_track_win_rate NUMERIC(8,4);
+            RAISE NOTICE 'Added missing column: jockey_track_win_rate';
+        END IF;
+        
+        -- trainer_track_win_rate
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'trainer_track_win_rate') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN trainer_track_win_rate NUMERIC(8,4);
+            RAISE NOTICE 'Added missing column: trainer_track_win_rate';
+        END IF;
+        
+        -- track_category_win_rate
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'track_category_win_rate') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN track_category_win_rate NUMERIC(8,4);
+            RAISE NOTICE 'Added missing column: track_category_win_rate';
+        END IF;
+        
+        -- track_place_rate
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'race_training_dataset' 
+                       AND column_name = 'track_place_rate') THEN
+            ALTER TABLE race_training_dataset ADD COLUMN track_place_rate NUMERIC(8,4);
+            RAISE NOTICE 'Added missing column: track_place_rate';
         END IF;
     END $$;
 
