@@ -611,7 +611,7 @@ CREATE INDEX IF NOT EXISTS idx_rtd_horse_date_id
 ON race_training_dataset(horse_location_slug, race_date, race_id);
 
 WITH prev_class AS (
-    SELECT DISTINCT ON (horse_location_slug, race_date, race_id)
+    SELECT DISTINCT ON (r1.horse_location_slug, r1.race_date, r1.race_id)
         r1.race_id,
         r1.horse_location_slug,
         r2.class_level_numeric AS prev_class
