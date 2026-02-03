@@ -43,7 +43,7 @@
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                        WHERE table_name = 'race_training_dataset' 
                        AND column_name = 'speed_figure') THEN
-            ALTER TABLE race_training_dataset ADD COLUMN speed_figure NUMERIC(8,2);
+            ALTER TABLE race_training_dataset ADD COLUMN speed_figure NUMERIC(12,2);
             RAISE NOTICE 'Added missing column: speed_figure';
         END IF;
         
@@ -51,7 +51,7 @@
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                        WHERE table_name = 'race_training_dataset' 
                        AND column_name = 'avg_speed_figure') THEN
-            ALTER TABLE race_training_dataset ADD COLUMN avg_speed_figure NUMERIC(8,2);
+            ALTER TABLE race_training_dataset ADD COLUMN avg_speed_figure NUMERIC(12,2);
             RAISE NOTICE 'Added missing column: avg_speed_figure';
         END IF;
         
@@ -59,7 +59,7 @@
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                        WHERE table_name = 'race_training_dataset' 
                        AND column_name = 'best_speed_figure') THEN
-            ALTER TABLE race_training_dataset ADD COLUMN best_speed_figure NUMERIC(8,2);
+            ALTER TABLE race_training_dataset ADD COLUMN best_speed_figure NUMERIC(12,2);
             RAISE NOTICE 'Added missing column: best_speed_figure';
         END IF;
         
