@@ -26,15 +26,20 @@
 -- ============================================================================
 
 -- ============================================================================
--- STEP 1: SECTIONAL POSITIONS FROM race_results
+-- STEP 1: SECTIONAL POSITIONS — sectional_times preferred, race_results fallback
+-- Sectional data is 100% accurate; Racenet race_results can mis-map positions
+-- for non-standard distances (e.g. HK 1000m, 1400m, 1800m, 2200m).
 -- ============================================================================
 UPDATE race_training_dataset_new AS rtd SET
-    position_800m = rr.position_800m,
-    position_400m = rr.position_400m
+    position_800m = COALESCE(s.position_800m, rr.position_800m),
+    position_400m = COALESCE(s.position_400m, rr.position_400m)
 FROM race_results rr
+LEFT JOIN race_results_sectional_times s
+  ON rr.race_id = s.race_id AND rr.horse_number = s.horse_number::TEXT
 WHERE rtd.race_id = rr.race_id
   AND rtd.horse_slug = rr.horse_slug
-  AND (rr.position_800m IS NOT NULL OR rr.position_400m IS NOT NULL);
+  AND (s.position_800m IS NOT NULL OR s.position_400m IS NOT NULL
+       OR rr.position_800m IS NOT NULL OR rr.position_400m IS NOT NULL);
 
 -- Position improvements (from current race — will be removed in Phase 3)
 UPDATE race_training_dataset_new SET
@@ -90,7 +95,9 @@ WHERE rtd.race_id = sd.race_id AND rtd.horse_location_slug = sd.horse_location_s
 UPDATE race_training_dataset_new SET running_style = 'unknown' WHERE running_style IS NULL;
 
 -- ============================================================================
--- STEP 4: CLOSING/EARLY/SUSTAINED SCORES (will be in leakage set for removal)
+-- STEP 4: CLOSING/EARLY/SUSTAINED SCORES (SAFE — from historical windowed inputs)
+-- historical_avg_improvement, avg_early_position_800m, avg_mid_position_400m
+-- are all computed with ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
 -- ============================================================================
 UPDATE race_training_dataset_new SET
     closing_ability_score = CASE
