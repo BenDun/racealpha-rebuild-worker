@@ -27,18 +27,66 @@
 
 -- ============================================================================
 -- STEP 1: SECTIONAL POSITIONS — sectional_times preferred, race_results fallback
--- Sectional data is 100% accurate; Racenet race_results can mis-map positions
--- for non-standard distances (e.g. HK 1000m, 1400m, 1800m, 2200m).
+--
+-- CONVENTION MISMATCH:
+--   race_results:          position_800m = 800m TO GO (from finish)
+--   sectional_times:       position_800m = 800m FROM START
+--   training_dataset:      uses race_results convention (distance to go)
+--
+-- To get "position at Xm to go" from sectional_times:
+--   → look up column position_{race_distance - X}m
+--
+-- e.g. 1200m race, training position_800m (800m to go = 400m from start):
+--   → sectional position_400m
+--
+-- Sectional data is 100% accurate; Racenet can have NULLs or mis-mapped
+-- positions for HK non-standard distances.
 -- ============================================================================
 UPDATE race_training_dataset_new AS rtd SET
-    position_800m = COALESCE(s.position_800m, rr.position_800m),
-    position_400m = COALESCE(s.position_400m, rr.position_400m)
+    -- position_800m = "800m to go" = sectional position at (race_distance - 800) from start
+    position_800m = COALESCE(
+      CASE ROUND((rtd.race_distance - 800.0) / 200) * 200
+        WHEN 200  THEN s.position_200m
+        WHEN 400  THEN s.position_400m
+        WHEN 600  THEN s.position_600m
+        WHEN 800  THEN s.position_800m
+        WHEN 1000 THEN s.position_1000m
+        WHEN 1200 THEN s.position_1200m
+        WHEN 1400 THEN s.position_1400m
+        WHEN 1600 THEN s.position_1600m
+        WHEN 1800 THEN s.position_1800m
+        WHEN 2000 THEN s.position_2000m
+        WHEN 2200 THEN s.position_2200m
+        WHEN 2400 THEN s.position_2400m
+        ELSE NULL
+      END,
+      rr.position_800m
+    ),
+    -- position_400m = "400m to go" = sectional position at (race_distance - 400) from start
+    position_400m = COALESCE(
+      CASE ROUND((rtd.race_distance - 400.0) / 200) * 200
+        WHEN 200  THEN s.position_200m
+        WHEN 400  THEN s.position_400m
+        WHEN 600  THEN s.position_600m
+        WHEN 800  THEN s.position_800m
+        WHEN 1000 THEN s.position_1000m
+        WHEN 1200 THEN s.position_1200m
+        WHEN 1400 THEN s.position_1400m
+        WHEN 1600 THEN s.position_1600m
+        WHEN 1800 THEN s.position_1800m
+        WHEN 2000 THEN s.position_2000m
+        WHEN 2200 THEN s.position_2200m
+        WHEN 2400 THEN s.position_2400m
+        ELSE NULL
+      END,
+      rr.position_400m
+    )
 FROM race_results rr
 LEFT JOIN race_results_sectional_times s
   ON rr.race_id = s.race_id AND rr.horse_number = s.horse_number::TEXT
 WHERE rtd.race_id = rr.race_id
   AND rtd.horse_slug = rr.horse_slug
-  AND (s.position_800m IS NOT NULL OR s.position_400m IS NOT NULL
+  AND (s.race_id IS NOT NULL
        OR rr.position_800m IS NOT NULL OR rr.position_400m IS NOT NULL);
 
 -- Position improvements (from current race — will be removed in Phase 3)
