@@ -57,14 +57,6 @@ DROP INDEX IF EXISTS idx_rtd_location;
 -- Add any missing columns
 DO $$ 
 BEGIN
-    -- margin column for race margins
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'race_training_dataset' 
-                   AND column_name = 'margin') THEN
-        ALTER TABLE race_training_dataset ADD COLUMN margin NUMERIC(10,2);
-        RAISE NOTICE 'Added missing column: margin';
-    END IF;
-    
     -- distance_range column for grouping races
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                    WHERE table_name = 'race_training_dataset' 
@@ -143,62 +135,6 @@ BEGIN
                    AND column_name = 'avg_late_improvement') THEN
         ALTER TABLE race_training_dataset ADD COLUMN avg_late_improvement NUMERIC(6,2);
         RAISE NOTICE 'Added missing column: avg_late_improvement';
-    END IF;
-    
-    -- position_800m for sectional tracking
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'race_training_dataset' 
-                   AND column_name = 'position_800m') THEN
-        ALTER TABLE race_training_dataset ADD COLUMN position_800m INTEGER;
-        RAISE NOTICE 'Added missing column: position_800m';
-    END IF;
-    
-    -- position_400m for sectional tracking
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'race_training_dataset' 
-                   AND column_name = 'position_400m') THEN
-        ALTER TABLE race_training_dataset ADD COLUMN position_400m INTEGER;
-        RAISE NOTICE 'Added missing column: position_400m';
-    END IF;
-    
-    -- pos_improvement_800_400 for sectional improvement
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'race_training_dataset' 
-                   AND column_name = 'pos_improvement_800_400') THEN
-        ALTER TABLE race_training_dataset ADD COLUMN pos_improvement_800_400 NUMERIC(5,2);
-        RAISE NOTICE 'Added missing column: pos_improvement_800_400';
-    END IF;
-    
-    -- pos_improvement_400_finish for sectional improvement
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'race_training_dataset' 
-                   AND column_name = 'pos_improvement_400_finish') THEN
-        ALTER TABLE race_training_dataset ADD COLUMN pos_improvement_400_finish NUMERIC(5,2);
-        RAISE NOTICE 'Added missing column: pos_improvement_400_finish';
-    END IF;
-    
-    -- closing_ability_score (intermediate - removed by Phase 9)
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'race_training_dataset' 
-                   AND column_name = 'closing_ability_score') THEN
-        ALTER TABLE race_training_dataset ADD COLUMN closing_ability_score NUMERIC(6,2);
-        RAISE NOTICE 'Added missing column: closing_ability_score (intermediate)';
-    END IF;
-    
-    -- early_speed_score (intermediate - removed by Phase 9)
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'race_training_dataset' 
-                   AND column_name = 'early_speed_score') THEN
-        ALTER TABLE race_training_dataset ADD COLUMN early_speed_score NUMERIC(6,2);
-        RAISE NOTICE 'Added missing column: early_speed_score (intermediate)';
-    END IF;
-    
-    -- sustained_run_score (intermediate - removed by Phase 9)
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'race_training_dataset' 
-                   AND column_name = 'sustained_run_score') THEN
-        ALTER TABLE race_training_dataset ADD COLUMN sustained_run_score NUMERIC(6,2);
-        RAISE NOTICE 'Added missing column: sustained_run_score (intermediate)';
     END IF;
 END $$;
 

@@ -8,7 +8,8 @@ venv/
 env/
 .env
 
-# DuckDB
+# DuckDB - Data Lake
+data_lake/
 *.duckdb
 *.duckdb.wal
 
@@ -25,3 +26,4 @@ Thumbs.db
 # Temp files
 *.parquet
 *.csv
+.venv/

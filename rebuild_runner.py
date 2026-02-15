@@ -27,6 +27,8 @@ INTERMEDIATE_COLUMNS = [
     'speed_figure', 'speed_rating', 'early_speed_pct', 'strong_finish_pct',
     'pos_volatility_800',
     'early_speed_rating', 'finish_speed_rating',
+    'historical_early_pos_x_distance',
+    'running_style_x_distance_bucket',
     # Feature maturity columns (cold-start improvement - Feb 2026)
     'elo_races_count', 'feature_maturity_score',
     # Rail position features (Feb 2026 - genuine new signal)
@@ -199,7 +201,7 @@ def run_rebuild(skip_phases: list[int] = None):
 
         # Pre-check: ensure source tables exist
         tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-        required = ['race_results', 'races', 'race_training_dataset']
+        required = ['race_results', 'races', 'race_training_dataset', 'race_results_sectional_times', 'races_derived_sectional_margins']
         missing = [t for t in required if t not in tables]
         if missing:
             raise RuntimeError(f"Missing required tables: {missing}")

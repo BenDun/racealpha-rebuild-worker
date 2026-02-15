@@ -173,18 +173,34 @@ WHERE rtd.race_id = rst.race_id
   AND rst.finish_time IS NOT NULL;
 
 -- Calculate speed figure
+-- FIXED: Anti-leakage — standardize using only PRIOR races at this distance
+-- Previous version used GROUP BY across ALL races (included future race times)
 UPDATE race_training_dataset_new AS rtd SET
-    speed_figure = CASE
-        WHEN rtd.raw_time_seconds IS NOT NULL AND rtd.raw_time_seconds > 0 AND tb.std_time > 0
-        THEN ROUND(100 - ((rtd.raw_time_seconds - tb.avg_time) / tb.std_time * 10), 2)
-        ELSE NULL END
+    speed_figure = ROUND(COALESCE(sf.speed_fig, NULL), 2)
 FROM (
-    SELECT race_distance, AVG(raw_time_seconds) AS avg_time, STDDEV(raw_time_seconds) AS std_time
-    FROM race_training_dataset_new
-    WHERE raw_time_seconds IS NOT NULL AND raw_time_seconds > 0 AND final_position <= 3
-    GROUP BY race_distance HAVING COUNT(*) > 10
-) tb
-WHERE rtd.race_distance = tb.race_distance;
+    WITH ranked AS (
+        SELECT race_id, horse_location_slug, race_distance, race_date, raw_time_seconds, final_position,
+            ROW_NUMBER() OVER (PARTITION BY race_distance ORDER BY race_date, race_id) AS dist_seq
+        FROM race_training_dataset_new
+        WHERE raw_time_seconds IS NOT NULL AND raw_time_seconds > 0
+    ),
+    with_stats AS (
+        SELECT race_id, horse_location_slug, race_distance, raw_time_seconds,
+            AVG(CASE WHEN final_position <= 3 THEN raw_time_seconds ELSE NULL END)
+                OVER (PARTITION BY race_distance ORDER BY dist_seq ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_avg_time,
+            STDDEV(CASE WHEN final_position <= 3 THEN raw_time_seconds ELSE NULL END)
+                OVER (PARTITION BY race_distance ORDER BY dist_seq ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_std_time,
+            COUNT(CASE WHEN final_position <= 3 THEN 1 ELSE NULL END)
+                OVER (PARTITION BY race_distance ORDER BY dist_seq ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_count
+        FROM ranked
+    )
+    SELECT race_id, horse_location_slug,
+        CASE WHEN prior_count >= 10 AND prior_std_time > 0
+            THEN 100 - ((raw_time_seconds - prior_avg_time) / prior_std_time * 10)
+            ELSE NULL END AS speed_fig
+    FROM with_stats
+) sf
+WHERE rtd.race_id = sf.race_id AND rtd.horse_location_slug = sf.horse_location_slug;
 
 -- Historical speed figure averages
 UPDATE race_training_dataset_new AS rtd SET
@@ -595,6 +611,28 @@ UPDATE race_training_dataset_new SET
     jockey_place_x_trainer_place = ROUND(COALESCE(jockey_place_rate, 0) * COALESCE(trainer_place_rate, 0), 4),
     form_x_freshness = ROUND(COALESCE(form_momentum, 0) * COALESCE(form_recency_score, 0.5), 4),
     track_wr_x_distance_wr = ROUND(COALESCE(track_win_rate, 0) * COALESCE(distance_win_rate, 0), 4),
+    historical_early_pos_x_distance = ROUND(
+        CASE
+            WHEN COALESCE(total_runners, 0) > 1 AND avg_early_position_800m IS NOT NULL
+            THEN (avg_early_position_800m::NUMERIC / total_runners) * (COALESCE(race_distance, 1200)::NUMERIC / 1200)
+            ELSE 0.5
+        END
+    , 4),
+    running_style_x_distance_bucket = ROUND(CASE
+        WHEN LOWER(running_style) = 'leader' AND COALESCE(race_distance, 1200) <= 1200 THEN 1.00
+        WHEN LOWER(running_style) = 'leader' AND COALESCE(race_distance, 1200) <= 1600 THEN 0.75
+        WHEN LOWER(running_style) = 'leader' THEN 0.40
+        WHEN LOWER(running_style) IN ('on_pace', 'stalker') AND COALESCE(race_distance, 1200) <= 1400 THEN 0.80
+        WHEN LOWER(running_style) IN ('on_pace', 'stalker') AND COALESCE(race_distance, 1200) <= 2000 THEN 0.70
+        WHEN LOWER(running_style) IN ('on_pace', 'stalker') THEN 0.55
+        WHEN LOWER(running_style) = 'midfield' THEN 0.60
+        WHEN LOWER(running_style) IN ('off_pace') AND COALESCE(race_distance, 1200) >= 1800 THEN 0.70
+        WHEN LOWER(running_style) IN ('off_pace') THEN 0.55
+        WHEN LOWER(running_style) = 'closer' AND COALESCE(race_distance, 1200) >= 2000 THEN 1.00
+        WHEN LOWER(running_style) = 'closer' AND COALESCE(race_distance, 1200) >= 1600 THEN 0.85
+        WHEN LOWER(running_style) = 'closer' THEN 0.50
+        ELSE 0.50
+    END, 4),
     running_style_x_barrier = ROUND(CASE
         WHEN LOWER(running_style) = 'leader' THEN CASE WHEN barrier_position = 'inner' THEN 1.0 WHEN barrier_position = 'middle' THEN 0.5 ELSE 0.2 END
         WHEN LOWER(running_style) IN ('on_pace', 'stalker') THEN CASE WHEN barrier_position = 'inner' THEN 0.8 WHEN barrier_position = 'middle' THEN 0.7 ELSE 0.4 END
@@ -613,22 +651,38 @@ UPDATE race_training_dataset_new SET
 
 -- ============================================================================
 -- STEP 17: BARRIER ANALYSIS (Track-specific advantages)
+-- FIXED: Anti-leakage — uses windowed aggregates from PRIOR races only
+-- Previous version used GROUP BY across ALL races (leaked future outcomes)
 -- ============================================================================
 UPDATE race_training_dataset_new AS rtd SET
-    barrier_advantage_at_track = ROUND(COALESCE(bts.win_rate, 0) - COALESCE(ta.avg_track_wr, 0.1), 4),
-    barrier_effectiveness_score = ROUND(CASE WHEN COALESCE(ta.avg_track_wr, 0) > 0 THEN COALESCE(bts.win_rate, 0) / ta.avg_track_wr ELSE 1 END, 4)
+    barrier_advantage_at_track = ROUND(
+        CASE WHEN COALESCE(ba.prior_combo_races, 0) >= 20
+            THEN ba.prior_combo_wins::NUMERIC / ba.prior_combo_races
+                 - COALESCE(CASE WHEN ba.prior_track_races > 0 THEN ba.prior_track_wins::NUMERIC / ba.prior_track_races ELSE 0.1 END, 0.1)
+            ELSE 0 END
+    , 4),
+    barrier_effectiveness_score = ROUND(
+        CASE WHEN COALESCE(ba.prior_combo_races, 0) >= 20
+            AND ba.prior_track_races > 0
+            AND ba.prior_track_wins > 0
+            THEN (ba.prior_combo_wins::NUMERIC / ba.prior_combo_races) / (ba.prior_track_wins::NUMERIC / ba.prior_track_races)
+            ELSE 1 END
+    , 4)
 FROM (
-    SELECT track_name, barrier_position, ROUND(SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END)::NUMERIC / NULLIF(COUNT(*), 0), 4) AS win_rate
-    FROM race_training_dataset_new WHERE barrier_position IS NOT NULL AND track_name IS NOT NULL
-    GROUP BY track_name, barrier_position
-) bts
-JOIN (
-    SELECT track_name, AVG(win_rate) AS avg_track_wr
-    FROM (SELECT track_name, barrier_position, SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END)::NUMERIC / NULLIF(COUNT(*), 0) AS win_rate
-          FROM race_training_dataset_new WHERE barrier_position IS NOT NULL GROUP BY track_name, barrier_position) sub
-    GROUP BY track_name
-) ta ON bts.track_name = ta.track_name
-WHERE rtd.track_name = bts.track_name AND rtd.barrier_position = bts.barrier_position;
+    SELECT race_id, horse_slug,
+        -- Win rate for this (track × barrier_position) from PRIOR races at this track
+        SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END) OVER w_combo AS prior_combo_wins,
+        COUNT(*) OVER w_combo AS prior_combo_races,
+        -- Overall track win rate from PRIOR races at this track
+        SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END) OVER w_track AS prior_track_wins,
+        COUNT(*) OVER w_track AS prior_track_races
+    FROM race_training_dataset_new
+    WHERE barrier_position IS NOT NULL AND track_name IS NOT NULL
+    WINDOW
+        w_combo AS (PARTITION BY track_name, barrier_position ORDER BY race_date, race_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+        w_track AS (PARTITION BY track_name ORDER BY race_date, race_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+) ba
+WHERE rtd.race_id = ba.race_id AND rtd.horse_slug = ba.horse_slug;
 
 -- Horse barrier group history
 UPDATE race_training_dataset_new AS rtd SET
@@ -831,6 +885,94 @@ FROM (
 ) rs
 WHERE rtd.race_id = rs.race_id AND rtd.horse_slug = rs.horse_slug;
 
+-- ============================================================================
+-- STEP 22B: HISTORICAL MARGIN + DECELERATION + BREAK FEATURES (Anti-leakage)
+-- ============================================================================
+ALTER TABLE race_training_dataset_new ADD COLUMN IF NOT EXISTS hist_margin_400m_avg DOUBLE;
+ALTER TABLE race_training_dataset_new ADD COLUMN IF NOT EXISTS hist_margin_800m_avg DOUBLE;
+ALTER TABLE race_training_dataset_new ADD COLUMN IF NOT EXISTS hist_margin_gain_800_to_400 DOUBLE;
+ALTER TABLE race_training_dataset_new ADD COLUMN IF NOT EXISTS hist_deceleration_ratio DOUBLE;
+ALTER TABLE race_training_dataset_new ADD COLUMN IF NOT EXISTS hist_break_consistency DOUBLE;
+ALTER TABLE race_training_dataset_new ADD COLUMN IF NOT EXISTS hist_break_bias DOUBLE;
+
+UPDATE race_training_dataset_new AS rtd SET
+    hist_margin_400m_avg = ROUND(hx.hist_margin_400m_avg, 4),
+    hist_margin_800m_avg = ROUND(hx.hist_margin_800m_avg, 4),
+    hist_margin_gain_800_to_400 = ROUND(hx.hist_margin_gain_800_to_400, 4),
+    hist_deceleration_ratio = ROUND(hx.hist_deceleration_ratio, 4),
+    hist_break_consistency = ROUND(hx.hist_break_consistency, 4),
+    hist_break_bias = ROUND(hx.hist_break_bias, 4)
+FROM (
+    WITH horse_history AS (
+        SELECT
+            rr.horse_slug,
+            s.race_id,
+            r.race_date,
+            src.total_runners,
+            -- Margins now from derived table (actual + derived_backward combined)
+            dsm.margin_400m::DOUBLE AS margin_400m,
+            dsm.margin_800m::DOUBLE AS margin_800m,
+            EXTRACT(EPOCH FROM s.sectional_400m)::DOUBLE AS sec_400m_time,
+            EXTRACT(EPOCH FROM s.sectional_800m)::DOUBLE AS sec_800m_time,
+            s.position_200m::DOUBLE AS pos_200m,
+            s.position_400m::DOUBLE AS pos_400m,
+            ROW_NUMBER() OVER (PARTITION BY rr.horse_slug ORDER BY r.race_date, s.race_id) AS race_seq
+        FROM race_results_sectional_times s
+        JOIN race_results rr
+          ON s.race_id = rr.race_id
+         AND s.horse_number::TEXT = rr.horse_number
+        JOIN races r ON s.race_id = r.race_id
+        LEFT JOIN races_derived_sectional_margins dsm
+          ON s.race_id = dsm.race_id
+         AND s.horse_number = dsm.horse_number
+        LEFT JOIN race_training_dataset_new src
+          ON src.race_id = rr.race_id
+         AND src.horse_slug = rr.horse_slug
+        WHERE rr.horse_slug IS NOT NULL
+          AND s.finish_position IS NOT NULL
+          AND s.finish_position <= 20
+    )
+    SELECT
+        h.horse_slug,
+        h.race_id,
+        AVG(h.margin_400m) OVER w_prior AS hist_margin_400m_avg,
+        AVG(h.margin_800m) OVER w_prior AS hist_margin_800m_avg,
+        AVG(CASE
+                WHEN h.margin_800m IS NOT NULL AND h.margin_400m IS NOT NULL
+                THEN h.margin_800m - h.margin_400m
+                ELSE NULL
+            END) OVER w_prior AS hist_margin_gain_800_to_400,
+        AVG(CASE
+                WHEN h.sec_400m_time IS NOT NULL
+                 AND h.sec_800m_time IS NOT NULL
+                 AND h.sec_400m_time > 0
+                THEN h.sec_800m_time / h.sec_400m_time
+                ELSE NULL
+            END) OVER w_prior AS hist_deceleration_ratio,
+        STDDEV(CASE
+                  WHEN h.total_runners IS NOT NULL
+                   AND h.total_runners > 1
+                   AND COALESCE(h.pos_200m, h.pos_400m) IS NOT NULL
+                  THEN (COALESCE(h.pos_200m, h.pos_400m) - 1.0) / (h.total_runners - 1.0)
+                  ELSE NULL
+               END) OVER w_prior AS hist_break_consistency,
+        AVG(CASE
+               WHEN h.total_runners IS NOT NULL
+                AND h.total_runners > 1
+                AND COALESCE(h.pos_200m, h.pos_400m) IS NOT NULL
+               THEN (COALESCE(h.pos_200m, h.pos_400m) - 1.0) / (h.total_runners - 1.0)
+               ELSE NULL
+            END) OVER w_prior AS hist_break_bias
+    FROM horse_history h
+    WINDOW w_prior AS (
+        PARTITION BY h.horse_slug
+        ORDER BY h.race_seq
+        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    )
+) hx
+WHERE rtd.race_id = hx.race_id
+  AND rtd.horse_slug = hx.horse_slug;
+
 -- Position columns from sectional times (leakage - will be removed in Phase 3)
 UPDATE race_training_dataset_new AS rtd SET
     position_at_400 = s.position_400m,
@@ -1011,40 +1153,43 @@ FROM (
 WHERE rtd.race_id = ts.race_id AND rtd.trainer_location_slug = ts.trainer_location_slug;
 
 -- Track condition advantage (horse's condition win rate vs overall)
--- FIX: Normalize track conditions to broad categories before matching
--- "Good"/"Good 3"/"Good 4" → 'good', "Soft"/"Soft 5"/"Soft 6"/"Soft 7" → 'soft_light'
--- "Heavy"/"heavy"/"Heavy 8"/"Heavy 9" → 'heavy', "Firm" → 'firm'
--- This reduces TCA null rate from ~49% to ~15% by pooling similar conditions
+-- FIXED: Anti-leakage — uses windowed self-join from PRIOR races only
+-- Previous version used GROUP BY from race_results (leaked future race outcomes)
+-- Simplified to 4 condition groups: Good / Soft / Heavy / Synthetic
+-- "Good"/"Good 3"/"Good 4"/"Firm" → 'good'
+-- "Soft"/"Soft 5"/"Soft 6"/"Soft 7" → 'soft'
+-- "Heavy"/"Heavy 8"/"Heavy 9"/"Heavy 10" → 'heavy'
+-- "Synthetic"/"All Weather" → 'synthetic'
 UPDATE race_training_dataset_new AS rtd SET
-    track_condition_advantage = ROUND(hcs.condition_win_rate - COALESCE(rtd.win_percentage, 0) / 100.0, 4)
+    track_condition_advantage = ROUND(
+        CASE WHEN COALESCE(cs.prior_condition_races, 0) >= 2
+            THEN cs.prior_condition_wins::NUMERIC / cs.prior_condition_races - COALESCE(rtd.win_percentage, 0) / 100.0
+            ELSE 0 END
+    , 4)
 FROM (
-    SELECT rr.horse_slug, 
-        CASE
-            WHEN LOWER(r.track_condition) LIKE 'good%' THEN 'good'
-            WHEN LOWER(r.track_condition) IN ('firm', 'firm 1', 'firm 2') THEN 'firm'
-            WHEN LOWER(r.track_condition) LIKE 'soft%' AND COALESCE(
-                TRY_CAST(REGEXP_EXTRACT(r.track_condition, '[0-9]+') AS INTEGER), 5) <= 6 THEN 'soft_light'
-            WHEN LOWER(r.track_condition) LIKE 'soft%' THEN 'soft_heavy'
-            WHEN LOWER(r.track_condition) LIKE 'heavy%' THEN 'heavy'
-            WHEN LOWER(r.track_condition) LIKE 'synthetic%' OR LOWER(r.track_condition) = 'synthetic' THEN 'synthetic'
-            ELSE LOWER(r.track_condition)
-        END AS condition_group,
-        SUM(CASE WHEN rr.position = 1 THEN 1 ELSE 0 END)::NUMERIC / NULLIF(COUNT(*), 0) AS condition_win_rate
-    FROM race_results rr JOIN races r ON rr.race_id = r.race_id
-    WHERE rr.horse_slug IS NOT NULL AND rr.position IS NOT NULL AND r.track_condition IS NOT NULL
-    GROUP BY rr.horse_slug, condition_group HAVING COUNT(*) >= 2
-) hcs
-WHERE rtd.horse_slug = hcs.horse_slug 
-  AND CASE
-    WHEN LOWER(rtd.track_condition) LIKE 'good%' THEN 'good'
-    WHEN LOWER(rtd.track_condition) IN ('firm', 'firm 1', 'firm 2') THEN 'firm'
-    WHEN LOWER(rtd.track_condition) LIKE 'soft%' AND COALESCE(
-        TRY_CAST(REGEXP_EXTRACT(rtd.track_condition, '[0-9]+') AS INTEGER), 5) <= 6 THEN 'soft_light'
-    WHEN LOWER(rtd.track_condition) LIKE 'soft%' THEN 'soft_heavy'
-    WHEN LOWER(rtd.track_condition) LIKE 'heavy%' THEN 'heavy'
-    WHEN LOWER(rtd.track_condition) LIKE 'synthetic%' OR LOWER(rtd.track_condition) = 'synthetic' THEN 'synthetic'
-    ELSE LOWER(rtd.track_condition)
-  END = hcs.condition_group;
+    WITH cond_mapped AS (
+        SELECT race_id, horse_location_slug, final_position, race_date,
+            CASE
+                WHEN track_condition ILIKE 'good%' OR track_condition ILIKE 'firm%' THEN 'good'
+                WHEN track_condition ILIKE 'soft%' THEN 'soft'
+                WHEN track_condition ILIKE 'heavy%' THEN 'heavy'
+                WHEN track_condition ILIKE 'synthetic%' OR track_condition ILIKE 'all weather%' THEN 'synthetic'
+                ELSE 'good'
+            END AS condition_group
+        FROM race_training_dataset_new
+        WHERE horse_location_slug IS NOT NULL AND track_condition IS NOT NULL
+    )
+    SELECT race_id, horse_location_slug,
+        SUM(CASE WHEN final_position = 1 THEN 1 ELSE 0 END) OVER w_prior AS prior_condition_wins,
+        COUNT(*) OVER w_prior AS prior_condition_races
+    FROM cond_mapped
+    WINDOW w_prior AS (
+        PARTITION BY horse_location_slug, condition_group
+        ORDER BY race_date, race_id
+        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    )
+) cs
+WHERE rtd.race_id = cs.race_id AND rtd.horse_location_slug = cs.horse_location_slug;
 
 -- ============================================================================
 -- STEP 28: SET DEFAULTS FOR MISC COLUMNS

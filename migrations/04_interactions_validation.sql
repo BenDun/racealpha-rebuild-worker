@@ -610,31 +610,28 @@ END;
 CREATE INDEX IF NOT EXISTS idx_rtd_horse_date_id
 ON race_training_dataset(horse_location_slug, race_date, race_id);
 
-WITH prev_class AS (
-    SELECT DISTINCT ON (r1.horse_location_slug, r1.race_date, r1.race_id)
-        r1.race_id,
-        r1.horse_location_slug,
-        r2.class_level_numeric AS prev_class
-    FROM race_training_dataset r1
-    INNER JOIN race_training_dataset r2 
-        ON r2.horse_location_slug = r1.horse_location_slug
-        AND (r2.race_date < r1.race_date OR (r2.race_date = r1.race_date AND r2.race_id < r1.race_id))
-    WHERE r1.horse_location_slug IS NOT NULL
-    ORDER BY r1.horse_location_slug, r1.race_date, r1.race_id, r2.race_date DESC, r2.race_id DESC
-)
 UPDATE race_training_dataset rtd
 SET 
     is_stepping_up = CASE 
-        WHEN pc.prev_class IS NULL THEN FALSE 
-        ELSE rtd.class_level_numeric < pc.prev_class 
+        WHEN prev.prev_class IS NULL THEN FALSE 
+        ELSE rtd.class_level_numeric < prev.prev_class 
     END,
     is_stepping_down = CASE 
-        WHEN pc.prev_class IS NULL THEN FALSE 
-        ELSE rtd.class_level_numeric > pc.prev_class 
+        WHEN prev.prev_class IS NULL THEN FALSE 
+        ELSE rtd.class_level_numeric > prev.prev_class 
     END
-FROM prev_class pc
-WHERE rtd.race_id = pc.race_id 
-  AND rtd.horse_location_slug = pc.horse_location_slug;
+FROM LATERAL (
+    SELECT rtd2.class_level_numeric AS prev_class
+    FROM race_training_dataset rtd2
+    WHERE rtd2.horse_location_slug = rtd.horse_location_slug
+      AND (
+        rtd2.race_date < rtd.race_date
+        OR (rtd2.race_date = rtd.race_date AND rtd2.race_id < rtd.race_id)
+      )
+    ORDER BY rtd2.race_date DESC, rtd2.race_id DESC
+    LIMIT 1
+) prev
+WHERE rtd.horse_location_slug IS NOT NULL;
 
 -- ============================================================================
 -- STEP 6D: TRACK DISTANCE FEATURES
@@ -663,7 +660,7 @@ SET
     track_distance_experience = COALESCE(tde.exp, 0),
     track_distance_win_rate_weighted = CASE 
         WHEN COALESCE(tde.exp, 0) > 0 
-        THEN ROUND((tde.wins::numeric / tde.exp * (1 + LN(tde.exp + 1) / 5))::numeric, 4)
+        THEN ROUND(tde.wins::numeric / tde.exp * (1 + LN(tde.exp + 1) / 5), 4)
         ELSE 0 
     END
 FROM track_dist_exp tde
